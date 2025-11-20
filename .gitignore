@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*.log
+.env
+*.json
+!requirements.txt
+users.json
+auth_keys.json
+subscriptions.json
