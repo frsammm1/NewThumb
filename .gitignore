@@ -4,6 +4,3 @@ __pycache__/
 .env
 *.json
 !requirements.txt
-users.json
-auth_keys.json
-subscriptions.json

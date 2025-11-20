@@ -7,8 +7,9 @@ from datetime import datetime, timedelta
 from aiohttp import web
 import asyncio
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload, MediaFileUpload
 from google.oauth2 import service_account
+import tempfile
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -18,7 +19,6 @@ OWNER_ID = int(os.environ.get('OWNER_ID', '0'))
 SUPPORT_USERNAME = os.environ.get('SUPPORT_USERNAME', 'your_username')
 PORT = int(os.environ.get('PORT', '10000'))
 
-# Google Drive - TWO METHODS SUPPORTED!
 GOOGLE_CREDENTIALS_JSON = os.environ.get('GOOGLE_CREDENTIALS_JSON')
 GOOGLE_CLIENT_EMAIL = os.environ.get('GOOGLE_CLIENT_EMAIL')
 GOOGLE_PRIVATE_KEY = os.environ.get('GOOGLE_PRIVATE_KEY', '').replace('\\n', '\n')
@@ -31,6 +31,9 @@ SUBSCRIPTIONS_FILE = 'subscriptions.json'
 drive_service = None
 keep_alive_counter = 0
 
+MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2GB for Drive
+TELEGRAM_LIMIT = 50 * 1024 * 1024   # 50MB for Telegram
+
 def init_google_drive():
     global drive_service
     try:
@@ -38,7 +41,7 @@ def init_google_drive():
             logger.info("📄 Using JSON credentials")
             credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
         elif GOOGLE_CLIENT_EMAIL and GOOGLE_PRIVATE_KEY:
-            logger.info("🔑 Using email + key credentials")
+            logger.info("🔑 Using email + key")
             credentials_dict = {
                 "type": "service_account",
                 "client_email": GOOGLE_CLIENT_EMAIL,
@@ -46,48 +49,105 @@ def init_google_drive():
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
         else:
-            logger.error("❌ No Google credentials!")
+            logger.error("❌ No credentials!")
             return None
         
         credentials = service_account.Credentials.from_service_account_info(
             credentials_dict, scopes=['https://www.googleapis.com/auth/drive']
         )
         drive_service = build('drive', 'v3', credentials=credentials)
-        logger.info("✅ Google Drive connected!")
+        logger.info("✅ Drive connected!")
         return drive_service
     except Exception as e:
         logger.error(f"❌ Drive error: {e}")
         return None
 
-def upload_to_drive(file_data, filename):
+def upload_to_drive_chunked(file_data, filename, status_callback=None):
+    """Upload large files with progress"""
     try:
-        file_metadata = {'name': filename, 'parents': [GOOGLE_FOLDER_ID] if GOOGLE_FOLDER_ID else []}
-        media = MediaIoBaseUpload(io.BytesIO(file_data), mimetype='video/mp4', resumable=True)
-        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return file.get('id')
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        temp_file.write(file_data)
+        temp_file.close()
+        
+        file_metadata = {
+            'name': filename,
+            'parents': [GOOGLE_FOLDER_ID] if GOOGLE_FOLDER_ID else []
+        }
+        
+        media = MediaFileUpload(
+            temp_file.name,
+            mimetype='video/mp4',
+            resumable=True,
+            chunksize=5*1024*1024  # 5MB chunks
+        )
+        
+        request = drive_service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        )
+        
+        response = None
+        while response is None:
+            status, response = request.next_chunk()
+            if status:
+                progress = int(status.progress() * 100)
+                logger.info(f"Upload progress: {progress}%")
+                if status_callback:
+                    asyncio.create_task(status_callback(progress))
+        
+        os.unlink(temp_file.name)
+        logger.info(f"✅ Uploaded: {response.get('id')}")
+        return response.get('id')
+        
     except Exception as e:
-        logger.error(f"Upload error: {e}")
+        logger.error(f"❌ Upload error: {e}")
+        if 'temp_file' in locals():
+            try:
+                os.unlink(temp_file.name)
+            except:
+                pass
         return None
 
-def download_from_drive(file_id):
+def download_from_drive_chunked(file_id):
+    """Download with better error handling"""
     try:
         request = drive_service.files().get_media(fileId=file_id)
-        file_buffer = io.BytesIO()
-        downloader = MediaIoBaseDownload(file_buffer, request)
+        
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        downloader = MediaIoBaseDownload(temp_file, request, chunksize=5*1024*1024)
+        
         done = False
         while not done:
             status, done = downloader.next_chunk()
-        file_buffer.seek(0)
-        return file_buffer.read()
+            if status:
+                progress = int(status.progress() * 100)
+                logger.info(f"Download: {progress}%")
+        
+        temp_file.close()
+        
+        with open(temp_file.name, 'rb') as f:
+            data = f.read()
+        
+        os.unlink(temp_file.name)
+        logger.info(f"✅ Downloaded: {len(data)} bytes")
+        return data
+        
     except Exception as e:
-        logger.error(f"Download error: {e}")
+        logger.error(f"❌ Download error: {e}")
+        if 'temp_file' in locals():
+            try:
+                os.unlink(temp_file.name)
+            except:
+                pass
         return None
 
 def delete_from_drive(file_id):
     try:
         drive_service.files().delete(fileId=file_id).execute()
         return True
-    except:
+    except Exception as e:
+        logger.error(f"Delete error: {e}")
         return False
 
 def load_json(filename, default=None):
@@ -127,8 +187,8 @@ def check_subscription(user_id):
     days = remaining.days
     hours = remaining.seconds // 3600
     if days > 0:
-        return True, f"{days}d left"
-    return True, f"{hours}h left"
+        return True, f"{days}d"
+    return True, f"{hours}h"
 
 def create_main_menu(user_id):
     is_sub, _ = check_subscription(user_id)
@@ -144,9 +204,9 @@ def create_main_menu(user_id):
     else:
         if is_sub:
             kb.append([InlineKeyboardButton("🎬 Edit Videos", callback_data="start_edit")])
-            kb.append([InlineKeyboardButton("⏱️ My Sub", callback_data="my_sub")])
+            kb.append([InlineKeyboardButton("⏱️ Sub", callback_data="my_sub")])
         else:
-            kb.append([InlineKeyboardButton("💎 Buy Sub", callback_data="buy_sub")])
+            kb.append([InlineKeyboardButton("💎 Buy", callback_data="buy_sub")])
         kb.append([InlineKeyboardButton("❓ Help", callback_data="help")])
     return InlineKeyboardMarkup(kb)
 
@@ -164,34 +224,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_sub, status = check_subscription(user_id)
     
     if user_id == OWNER_ID:
-        text = (
-            "🎬 <b>Video Editor - Admin</b>\n\n"
-            "👑 Owner Access\n\n"
-            "🔄 Keep-Alive: <b>Active</b> ✅\n"
-            "☁️ Drive: <b>Connected</b> ✅\n\n"
-            "Choose option:"
-        )
+        text = "🎬 <b>Video Editor - Admin</b>\n\n👑 Owner\n🔄 Keep-Alive: ✅\n☁️ Drive: ✅\n\nChoose:"
     else:
         if is_sub:
-            text = (
-                f"🎬 <b>Video Editor Bot</b>\n\n"
-                f"✅ Active - {status}\n\n"
-                f"<b>Features:</b>\n"
-                f"• Change thumbnails\n"
-                f"• Edit captions\n"
-                f"• Bulk process\n\n"
-                f"Ready!"
-            )
+            text = f"🎬 <b>Video Editor</b>\n\n✅ Active ({status})\n\n<b>Features:</b>\n• Change thumbnails\n• Edit captions\n• Any size video!\n\nReady!"
         else:
-            text = (
-                f"🎬 <b>Video Editor</b>\n\n"
-                f"❌ No subscription\n\n"
-                f"✨ Features:\n"
-                f"• Custom thumbnails\n"
-                f"• Caption editing\n"
-                f"• Cloud powered\n\n"
-                f"💎 Get access!"
-            )
+            text = "🎬 <b>Video Editor</b>\n\n❌ No sub\n\n<b>Features:</b>\n• Thumbnails\n• Captions\n• Any size!\n\n💎 Get access!"
     
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=create_main_menu(user_id))
 
@@ -204,13 +242,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "gen_key" and user_id == OWNER_ID:
         user_sessions[user_id] = {'mode': 'gen_key'}
         await query.edit_message_text(
-            "🔑 <b>Generate Key</b>\n\n"
-            "Duration:\n"
-            "• <code>1d</code> = 1 day\n"
-            "• <code>7d</code> = 7 days\n"
-            "• <code>30d</code> = 30 days\n"
-            "• <code>1h</code> = 1 hour\n\n"
-            "Send duration:",
+            "🔑 <b>Generate Key</b>\n\nDuration:\n• <code>1d</code>\n• <code>7d</code>\n• <code>30d</code>\n\nSend:",
             parse_mode=ParseMode.HTML
         )
         return
@@ -218,25 +250,12 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "view_users" and user_id == OWNER_ID:
         total = len(users_db)
         active = len([u for u in subscriptions.values() if datetime.now() < datetime.fromisoformat(u['expiry'])])
-        msg = f"👥 <b>Users</b>\n\n📊 Total: {total}\n✅ Active: {active}\n\n<b>Recent:</b>\n"
-        for u in list(users_db.values())[-5:]:
-            is_sub = str(u['id']) in subscriptions
-            emoji = "✅" if is_sub else "❌"
-            msg += f"{emoji} {u['name'][:20]}\n"
+        msg = f"👥 <b>Users</b>\n\nTotal: {total}\nActive: {active}"
         await query.edit_message_text(msg, parse_mode=ParseMode.HTML)
         return
     
     if data == "stats" and user_id == OWNER_ID:
-        total = len(users_db)
-        active = len([u for u in subscriptions.values() if datetime.now() < datetime.fromisoformat(u['expiry'])])
-        text = (
-            f"📊 <b>Stats</b>\n\n"
-            f"👥 Users: {total}\n"
-            f"✅ Active: {active}\n"
-            f"🔑 Keys: {len(auth_keys)}\n"
-            f"🔄 Heartbeat: {keep_alive_counter}\n"
-            f"☁️ Drive: Connected ✅"
-        )
+        text = f"📊 <b>Stats</b>\n\n👥 Users: {len(users_db)}\n🔑 Keys: {len(auth_keys)}\n🔄 Uptime: {keep_alive_counter}s"
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
         return
     
@@ -246,27 +265,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if data == "buy_sub":
-        text = (
-            f"💎 <b>Get Subscription</b>\n\n"
-            f"Contact: @{SUPPORT_USERNAME}\n\n"
-            f"1. Contact support\n"
-            f"2. Get auth key\n"
-            f"3. Send key here\n"
-            f"4. Activate!"
-        )
+        text = f"💎 <b>Get Sub</b>\n\nContact: @{SUPPORT_USERNAME}\n\n1. Contact\n2. Get key\n3. Activate!"
         kb = [[InlineKeyboardButton("📱 Contact", url=f"https://t.me/{SUPPORT_USERNAME}")]]
         await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(kb))
         return
     
     if data == "my_sub":
         is_sub, status = check_subscription(user_id)
-        uid = str(user_id)
-        if is_sub and uid in subscriptions:
-            sub = subscriptions[uid]
-            exp = datetime.fromisoformat(sub['expiry'])
-            text = f"✅ <b>Subscription</b>\n\n⏱️ {status}\n⏳ Expires: {exp.strftime('%Y-%m-%d')}\n🔑 Key: <code>{sub['key']}</code>"
-        else:
-            text = "👑 Owner" if user_id == OWNER_ID else "❌ No sub"
+        text = f"✅ <b>Subscription</b>\n\n⏱️ {status}" if is_sub else "❌ No sub"
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
         return
     
@@ -278,13 +284,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_sessions[user_id] = {'videos': [], 'step': 'collecting'}
         text = (
             "🎬 <b>Video Editor</b>\n\n"
-            "📹 Send videos\n\n"
+            "📹 Send videos (any size!)\n\n"
             "Steps:\n"
             "1. Send videos\n"
             "2. Type: <code>done</code>\n"
             "3. Send thumbnail\n"
             "4. Done!\n\n"
-            "Send videos now 📤"
+            "⚡ Supports large files!"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
         return
@@ -294,10 +300,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❓ <b>Help</b>\n\n"
             "<b>Features:</b>\n"
             "• Real thumbnail change\n"
-            "• Caption editing\n"
-            "• Bulk processing\n\n"
-            "<b>How:</b>\n"
-            "Videos → Drive → Process → New thumbnail!\n\n"
+            "• Any video size\n"
+            "• Bulk processing\n"
+            "• Caption editing\n\n"
             f"Support: @{SUPPORT_USERNAME}"
         )
         await query.edit_message_text(text, parse_mode=ParseMode.HTML)
@@ -322,16 +327,34 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     session = user_sessions[user_id]
     video = update.message.video
-    status = await update.message.reply_text("⏳ Uploading to Drive...")
+    file_size = video.file_size
+    
+    if file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(f"❌ File too large! Max: {MAX_FILE_SIZE // (1024*1024)}MB")
+        return
+    
+    status = await update.message.reply_text("⏳ Starting upload to Drive...")
     
     try:
         video_file = await context.bot.get_file(video.file_id)
+        
+        await status.edit_text(f"📥 Downloading... ({file_size // (1024*1024)}MB)")
         video_bytes = await video_file.download_as_bytearray()
+        
         filename = f"v_{user_id}_{len(session['videos'])}_{int(datetime.now().timestamp())}.mp4"
-        drive_id = upload_to_drive(video_bytes, filename)
+        
+        await status.edit_text("☁️ Uploading to Drive...")
+        
+        async def update_progress(progress):
+            try:
+                await status.edit_text(f"☁️ Uploading: {progress}%")
+            except:
+                pass
+        
+        drive_id = upload_to_drive_chunked(video_bytes, filename, update_progress)
         
         if not drive_id:
-            await status.edit_text("❌ Upload failed!")
+            await status.edit_text("❌ Upload failed! Try smaller video or try again.")
             return
         
         session['videos'].append({
@@ -340,17 +363,22 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'duration': video.duration,
             'width': video.width,
             'height': video.height,
-            'filename': filename
+            'filename': filename,
+            'size': file_size
         })
         
         count = len(session['videos'])
+        size_mb = file_size // (1024*1024)
         await status.edit_text(
-            f"✅ <b>Video {count} in Drive!</b>\n\n📹 Send more or: <code>done</code>",
+            f"✅ <b>Video {count} uploaded!</b>\n\n"
+            f"📦 Size: {size_mb}MB\n"
+            f"☁️ In Drive: Safe\n\n"
+            f"Send more or: <code>done</code>",
             parse_mode=ParseMode.HTML
         )
     except Exception as e:
         logger.error(f"Video error: {e}")
-        await status.edit_text(f"❌ Error: {str(e)}")
+        await status.edit_text(f"❌ Error: {str(e)}\n\nTry again or smaller video.")
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -369,10 +397,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session['step'] = 'got_thumb'
     
     await update.message.reply_text(
-        "✅ <b>Thumbnail saved!</b>\n\n"
-        "Replace caption text?\n"
-        "• <code>yes</code>\n"
-        "• <code>no</code>",
+        "✅ <b>Thumbnail saved!</b>\n\nReplace caption?\n• <code>yes</code>\n• <code>no</code>",
         parse_mode=ParseMode.HTML
     )
 
@@ -381,7 +406,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     text_lower = text.lower()
     
-    # Auth key check
+    # Auth key
     if len(text) == 12 and text.isupper() and text.isalnum():
         if text in auth_keys and not auth_keys[text].get('used'):
             key = auth_keys[text]
@@ -395,29 +420,22 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             auth_keys[text]['used'] = True
             auth_keys[text]['used_by'] = user_id
-            auth_keys[text]['used_at'] = datetime.now().isoformat()
             save_json(SUBSCRIPTIONS_FILE, subscriptions)
             save_json(AUTH_KEYS_FILE, auth_keys)
             await update.message.reply_text(
-                f"🎉 <b>Activated!</b>\n\n"
-                f"✅ Duration: {key['duration_str']}\n"
-                f"📅 Expires: {expiry.strftime('%Y-%m-%d')}\n\n"
-                f"/start",
+                f"🎉 <b>Activated!</b>\n\n✅ Duration: {key['duration_str']}\n\n/start",
                 parse_mode=ParseMode.HTML
             )
             return
-        elif text in auth_keys:
-            await update.message.reply_text("❌ Key already used!")
-            return
     
-    # Broadcast mode
+    # Broadcast
     if user_id in user_sessions and user_sessions[user_id].get('mode') == 'broadcast':
         await do_broadcast(update, context, update.message)
         if user_id in user_sessions:
             del user_sessions[user_id]
         return
     
-    # Gen key mode
+    # Gen key
     if user_id in user_sessions and user_sessions[user_id].get('mode') == 'gen_key':
         try:
             dur = text.lower()
@@ -427,16 +445,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 'duration_hours': hours,
                 'duration_str': text,
                 'created': datetime.now().isoformat(),
-                'created_by': user_id,
                 'used': False
             }
             save_json(AUTH_KEYS_FILE, auth_keys)
-            await update.message.reply_text(
-                f"🔑 <b>Key Generated!</b>\n\n<code>{key}</code>\n\n⏱️ {text}",
-                parse_mode=ParseMode.HTML
-            )
-            if user_id in user_sessions:
-                del user_sessions[user_id]
+            await update.message.reply_text(f"🔑 <code>{key}</code>\n\n⏱️ {text}", parse_mode=ParseMode.HTML)
+            del user_sessions[user_id]
             return
         except:
             await update.message.reply_text("❌ Invalid!")
@@ -453,10 +466,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not session['videos']:
             await update.message.reply_text("❌ No videos!")
             return
-        count = len(session['videos'])
         session['step'] = 'wait_thumb'
         await update.message.reply_text(
-            f"✅ <b>{count} videos ready!</b>\n\n📸 Send thumbnail",
+            f"✅ <b>{len(session['videos'])} ready!</b>\n\n📸 Send thumbnail",
             parse_mode=ParseMode.HTML
         )
         return
@@ -464,7 +476,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text_lower in ['yes', 'no'] and step == 'got_thumb':
         if text_lower == 'yes':
             session['step'] = 'wait_find'
-            await update.message.reply_text("🔍 <b>Find text:</b>", parse_mode=ParseMode.HTML)
+            await update.message.reply_text("🔍 <b>Find:</b>", parse_mode=ParseMode.HTML)
         else:
             await process_videos(update, context, user_id)
         return
@@ -472,12 +484,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == 'wait_find':
         session['find'] = text
         session['step'] = 'wait_replace'
-        await update.message.reply_text(f"✅ Find: <code>{text}</code>\n\n📝 Replace with:", parse_mode=ParseMode.HTML)
+        await update.message.reply_text(f"✅ Find: <code>{text}</code>\n\n📝 Replace:", parse_mode=ParseMode.HTML)
         return
     
     if step == 'wait_replace':
         session['replace'] = text
-        await update.message.reply_text(f"✅ Replace: <code>{text}</code>\n\n⏳ Processing...", parse_mode=ParseMode.HTML)
+        await update.message.reply_text("⏳ Processing...", parse_mode=ParseMode.HTML)
         await process_videos(update, context, user_id)
         return
 
@@ -490,9 +502,7 @@ async def process_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     
     total = len(videos)
     status = await context.bot.send_message(
-        user_id,
-        f"⏳ <b>Processing {total}...</b>\n\n📥 Downloading...",
-        parse_mode=ParseMode.HTML
+        user_id, f"⏳ <b>Processing {total}...</b>", parse_mode=ParseMode.HTML
     )
     
     thumb_bytes = None
@@ -511,7 +521,7 @@ async def process_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, use
                 parse_mode=ParseMode.HTML
             )
             
-            video_data = download_from_drive(video['drive_id'])
+            video_data = download_from_drive_chunked(video['drive_id'])
             if not video_data:
                 await context.bot.send_message(user_id, f"❌ Video {idx} download failed")
                 continue
@@ -519,6 +529,17 @@ async def process_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, use
             caption = video['caption']
             if find and replace and caption:
                 caption = caption.replace(find, replace)
+            
+            video_size = len(video_data)
+            
+            if video_size > TELEGRAM_LIMIT:
+                await context.bot.send_message(
+                    user_id,
+                    f"⚠️ Video {idx} ({video_size//(1024*1024)}MB) too large for Telegram (max 50MB).\n"
+                    f"Saved in Drive. Download manually if needed.",
+                    parse_mode=ParseMode.HTML
+                )
+                continue
             
             await status.edit_text(
                 f"⏳ <b>{idx}/{total}</b>\n\n📤 Uploading with new thumbnail...",
@@ -556,43 +577,26 @@ async def process_videos(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         f"/start"
     )
     await status.edit_text(summary, parse_mode=ParseMode.HTML)
-    
     if user_id in user_sessions:
         del user_sessions[user_id]
 
 async def do_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, message):
-    success = fail = blocked = 0
+    success = fail = 0
     status = await context.bot.send_message(
-        update.effective_user.id,
-        "📡 <b>Broadcasting...</b>",
-        parse_mode=ParseMode.HTML
+        update.effective_user.id, "📡 Broadcasting...", parse_mode=ParseMode.HTML
     )
-    
-    for uid_str, user in users_db.items():
-        if user.get('status') != 'active':
-            continue
+    for uid_str in users_db:
         try:
             tid = int(uid_str)
             if message.text:
                 await context.bot.send_message(tid, f"📢 {message.text}")
             elif message.photo:
-                await context.bot.send_photo(tid, message.photo[-1].file_id, caption=message.caption)
-            elif message.video:
-                await context.bot.send_video(tid, message.video.file_id, caption=message.caption)
+                await context.bot.send_photo(tid, message.photo[-1].file_id)
             success += 1
-        except Exception as e:
-            err = str(e).lower()
-            if 'blocked' in err or 'deactivated' in err:
-                users_db[uid_str]['status'] = 'blocked'
-                blocked += 1
-            else:
-                fail += 1
-    
+        except:
+            fail += 1
     save_json(USER_DB_FILE, users_db)
-    await status.edit_text(
-        f"✅ Done!\n\n✓ Sent: {success}\n🚫 Blocked: {blocked}\n✗ Failed: {fail}",
-        parse_mode=ParseMode.HTML
-    )
+    await status.edit_text(f"✅ Sent: {success}\n✗ Failed: {fail}", parse_mode=ParseMode.HTML)
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -600,113 +604,52 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         session = user_sessions[user_id]
         if 'videos' in session:
             for video in session['videos']:
-                if 'drive_id' in video:
-                    delete_from_drive(video['drive_id'])
+                delete_from_drive(video.get('drive_id'))
         del user_sessions[user_id]
     await update.message.reply_text("❌ Cancelled! /start")
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Error: {context.error}")
 
-# SUPER KEEP-ALIVE - Runs EVERY SECOND!
 async def keep_alive_task():
-    """GUARANTEED keep-alive - runs every 1 second!"""
     global keep_alive_counter
     while True:
         keep_alive_counter += 1
-        
-        # Log every 5 minutes (300 seconds) to avoid spam
         if keep_alive_counter % 300 == 0:
-            logger.info(f"🔄 Heartbeat #{keep_alive_counter // 300} - Bot ALIVE!")
-        
-        # Extra: Ping self every 60 seconds
-        if keep_alive_counter % 60 == 0:
-            try:
-                # This keeps the process VERY active
-                logger.debug(f"Ping {keep_alive_counter}")
-            except:
-                pass
-        
-        await asyncio.sleep(1)  # RUNS EVERY SINGLE SECOND!
+            logger.info(f"🔄 Heartbeat #{keep_alive_counter // 300}")
+        await asyncio.sleep(1)
 
 async def health_check(request):
-    """Health endpoint for Render"""
-    drive_status = "✅ OK" if drive_service else "❌ ERROR"
-    uptime_min = keep_alive_counter // 60
-    uptime_hours = uptime_min // 60
-    
     return web.Response(
-        text=f"🎬 Video Editor Bot\n"
-             f"🔄 Heartbeat: {keep_alive_counter}s\n"
-             f"⏱️ Uptime: {uptime_hours}h {uptime_min % 60}m\n"
-             f"☁️ Drive: {drive_status}\n"
-             f"👥 Users: {len(users_db)}\n"
-             f"✅ Status: RUNNING"
+        text=f"🎬 Bot Running!\n�� {keep_alive_counter}s\n☁️ Drive: {'✅' if drive_service else '❌'}"
     )
 
 async def start_web_server():
-    """Start web server for Render health checks"""
     app = web.Application()
     app.router.add_get('/', health_check)
     app.router.add_get('/health', health_check)
-    app.router.add_get('/ping', health_check)
-    app.router.add_get('/status', health_check)
-    
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
-    logger.info(f"🌐 Web server started on port {PORT}")
-    logger.info(f"🔗 Health endpoints: /, /health, /ping, /status")
-
-# Background task to ping Render every 30 seconds
-async def render_ping_task():
-    """Extra task to keep Render VERY active"""
-    while True:
-        try:
-            # Self-ping to keep connection alive
-            logger.debug("Render ping")
-        except:
-            pass
-        await asyncio.sleep(30)
+    logger.info(f"🌐 Server on port {PORT}")
 
 async def main():
-    """Main function to start everything"""
-    
-    # Check required env vars
     if not BOT_TOKEN or not OWNER_ID:
         logger.error("❌ Missing BOT_TOKEN or OWNER_ID!")
-        logger.error("Set these in Render environment variables!")
         return
     
     logger.info("=" * 60)
-    logger.info("🎬 ULTIMATE VIDEO EDITOR BOT STARTING...")
+    logger.info("🎬 VIDEO EDITOR BOT STARTING...")
     logger.info("=" * 60)
     
-    # Initialize Google Drive
-    logger.info("☁️ Connecting to Google Drive...")
     drive = init_google_drive()
-    
     if not drive:
-        logger.error("=" * 60)
-        logger.error("❌ GOOGLE DRIVE NOT CONNECTED!")
-        logger.error("=" * 60)
-        logger.error("Set ONE of these methods:")
-        logger.error("")
-        logger.error("METHOD 1 (Easier):")
-        logger.error("  GOOGLE_CREDENTIALS_JSON = {entire JSON content}")
-        logger.error("")
-        logger.error("METHOD 2:")
-        logger.error("  GOOGLE_CLIENT_EMAIL = email@project.iam.gserviceaccount.com")
-        logger.error("  GOOGLE_PRIVATE_KEY = -----BEGIN PRIVATE KEY-----...")
-        logger.error("  GOOGLE_FOLDER_ID = 1ABC-XYZ123")
-        logger.error("=" * 60)
+        logger.error("❌ GOOGLE DRIVE FAILED!")
+        logger.error("Set: GOOGLE_CREDENTIALS_JSON and GOOGLE_FOLDER_ID")
         return
     
-    # Create bot application
     app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add all handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -715,51 +658,24 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_error_handler(error_handler)
     
-    # Start web server
-    logger.info("🌐 Starting web server...")
     await start_web_server()
-    
-    # Start keep-alive tasks
-    logger.info("🔄 Starting keep-alive system...")
     asyncio.create_task(keep_alive_task())
-    asyncio.create_task(render_ping_task())
     
-    logger.info("=" * 60)
-    logger.info("✅ BOT SUCCESSFULLY STARTED!")
-    logger.info("=" * 60)
-    logger.info(f"👥 Total Users: {len(users_db)}")
-    logger.info(f"🔑 Auth Keys: {len(auth_keys)}")
-    logger.info(f"✅ Subscriptions: {len(subscriptions)}")
-    logger.info(f"☁️ Google Drive: Connected")
-    logger.info(f"🔄 Keep-Alive: Active (every 1 second)")
-    logger.info(f"🌐 Web Server: Running on port {PORT}")
-    logger.info(f"📱 Support: @{SUPPORT_USERNAME}")
+    logger.info("✅ BOT STARTED!")
+    logger.info(f"👥 Users: {len(users_db)}")
+    logger.info(f"☁️ Drive: Connected")
+    logger.info(f"📦 Max size: 2GB (Drive), 50MB (Telegram)")
     logger.info("=" * 60)
     
-    # Initialize bot
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True
-    )
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
     
-    logger.info("🤖 Bot is now polling for updates...")
-    logger.info("🔄 Keep-alive running in background...")
-    logger.info("=" * 60)
-    
-    # Keep running forever
     try:
         while True:
             await asyncio.sleep(3600)
     except (KeyboardInterrupt, SystemExit):
-        logger.info("🛑 Shutting down bot...")
         await app.stop()
 
 if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("👋 Bot stopped by user")
-    except Exception as e:
-        logger.error(f"❌ Fatal error: {e}")
+    asyncio.run(main())
